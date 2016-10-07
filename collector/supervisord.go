@@ -40,6 +40,7 @@ func init() {
 }
 
 func NewSupervisordCollector() (Collector, error) {
+	warnDeprecated("supervisord")
 	client, err := xmlrpc.NewClient(*supervisordURL, nil)
 	if err != nil {
 		return nil, err

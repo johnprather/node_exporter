@@ -84,6 +84,7 @@ func init() {
 // Takes a prometheus registry and returns a new Collector exposing
 // logind statistics.
 func NewLogindCollector() (Collector, error) {
+	warnDeprecated("logind")
 	return &logindCollector{}, nil
 }
 

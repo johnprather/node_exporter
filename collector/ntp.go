@@ -41,6 +41,7 @@ func init() {
 // Takes a prometheus registry and returns a new Collector exposing
 // the offset between ntp and the current system time.
 func NewNtpCollector() (Collector, error) {
+	log.Warnf("The ntp collector is deprecated and will be removed in an upcoming version")
 	if *ntpServer == "" {
 		return nil, fmt.Errorf("no NTP server specified, see -collector.ntp.server")
 	}

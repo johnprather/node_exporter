@@ -30,6 +30,7 @@ func init() {
 }
 
 func NewRunitCollector() (Collector, error) {
+	warnDeprecated("runit")
 	var (
 		subsystem   = "service"
 		constLabels = prometheus.Labels{"supervisor": "runit"}

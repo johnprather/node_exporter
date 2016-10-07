@@ -54,6 +54,7 @@ func init() {
 // Takes a prometheus registry and returns a new Collector exposing
 // systemd statistics.
 func NewSystemdCollector() (Collector, error) {
+	warnDeprecated("systemd")
 	const subsystem = "systemd"
 
 	unitDesc := prometheus.NewDesc(
