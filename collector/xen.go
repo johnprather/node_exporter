@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build yesxen
+// +build xapi
 
 package collector
 
@@ -24,19 +24,21 @@ import (
 
 	"context"
 
+	"github.com/prometheus/common/log"
+
 	xenAPI "github.com/amfranz/go-xen-api-client"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 const xapiSocket = "/var/xapi/xapi"
+const collectorPrefix = "xapi"
 
 type xenCollector struct {
-	metrics        []prometheus.Gauge
-	metricsStaging []prometheus.Gauge
+	metrics []prometheus.Gauge
 }
 
 func init() {
-	Factories["xen"] = NewXenCollector
+	Factories[collectorPrefix] = NewXenCollector
 }
 
 // Take a prometheus registry and return a new Collector exposing xen data.
@@ -44,26 +46,27 @@ func NewXenCollector() (Collector, error) {
 	return &xenCollector{}, nil
 }
 
-func (c *xenCollector) Update(ch chan<- prometheus.Metric) (err error) {
+// newMetric instantiates a prometheus Gauge object
+func (c *xenCollector) newMetric(name string, help string,
+	labels prometheus.Labels, value float64) prometheus.Gauge {
 
-	var boolToFloat = func(inBool bool) float64 {
-		if inBool {
-			return 1
-		}
-		return 0
-	}
+	metric := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   Namespace,
+		Name:        collectorPrefix + "_" + name,
+		Help:        help,
+		ConstLabels: labels,
+	})
+	metric.Set(value)
+	return metric
+}
 
-	var newMetric = func(name string, help string,
-		labels prometheus.Labels, value float64) prometheus.Gauge {
+// genXAPIMetrics pulls data from xapi and populates c.metrics
+func (c *xenCollector) genXAPIMetrics() error {
 
-		metric := prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace:   Namespace,
-			Name:        "xen_" + name,
-			Help:        help,
-			ConstLabels: labels,
-		})
-		return metric
-	}
+	c.metrics = make([]prometheus.Gauge, 0)
+
+	// this comes in handy for boolean metrics below
+	boolToFloat := map[bool]float64{true: 1, false: 0}
 
 	var myHostRef xenAPI.HostRef
 	var iAmMaster bool
@@ -155,54 +158,56 @@ func (c *xenCollector) Update(ch chan<- prometheus.Metric) (err error) {
 		cpuCount, _ := strconv.ParseFloat(hostRec.CPUInfo["cpu_count"], 64)
 
 		// set cpu_count metric for the host
-		cpuCountMetric := newMetric("cpu_count",
+		cpuCountMetric := c.newMetric("cpu_count",
 			"number of physical cpus on the host",
 			hostLabels, cpuCount)
-		c.metricsStaging = append(c.metricsStaging, cpuCountMetric)
+		c.metrics = append(c.metrics, cpuCountMetric)
 
 		// set cpu_allocation metric for the host
-		cpuPctAllocatedMetric := newMetric("cpu_pct_allocated",
+		cpuPctAllocatedMetric := c.newMetric("cpu_pct_allocated",
 			"percent of vCPUs over physical CPUs",
 			hostLabels, float64(vCPUCount)*100/cpuCount)
-		c.metricsStaging = append(c.metricsStaging, cpuPctAllocatedMetric)
+		c.metrics = append(c.metrics, cpuPctAllocatedMetric)
 
 		// set memory_total metric for host
-		memoryTotalMetric := newMetric("memory_total",
+		memoryTotalMetric := c.newMetric("memory_total",
 			"total host memory (bytes)", hostLabels,
 			float64(hostMetricsRecs[hostRec.Metrics].MemoryTotal))
-		c.metricsStaging = append(c.metricsStaging, memoryTotalMetric)
+		c.metrics = append(c.metrics, memoryTotalMetric)
 
 		// set memory_free metric for host
-		memoryFreeMetric := newMetric("memory_free",
+		memoryFreeMetric := c.newMetric("memory_free",
 			"free host memory (bytes)", hostLabels,
 			float64(hostMetricsRecs[hostRec.Metrics].MemoryFree))
-		c.metricsStaging = append(c.metricsStaging, memoryFreeMetric)
+		c.metrics = append(c.metrics, memoryFreeMetric)
 
 		// set memory_allocation metric for host
 		memory_used := hostMetricsRec.MemoryTotal - hostMetricsRec.MemoryFree
-		memoryPctAllocatedMetric := newMetric("memory_pct_allocated",
+		memoryPctAllocatedMetric := c.newMetric("memory_pct_allocated",
 			"percent of memory_total less memory_free over memory_total",
 			hostLabels,
 			float64(memory_used)*100/float64(hostMetricsRec.MemoryTotal))
-		c.metricsStaging = append(c.metricsStaging, memoryPctAllocatedMetric)
+		c.metrics = append(c.metrics, memoryPctAllocatedMetric)
 
 		// set resident_vcpu_count metric for host
-		residentVCPUCountMetric := newMetric("resident_vcpu_count",
+		residentVCPUCountMetric := c.newMetric("resident_vcpu_count",
 			"count of vCPUs on VMs running on the host", hostLabels,
 			float64(vCPUCount))
-		c.metricsStaging = append(c.metricsStaging, residentVCPUCountMetric)
+		c.metrics = append(c.metrics, residentVCPUCountMetric)
 
 		// set resident_vm_count metric for host
-		residentVMCountMetric := newMetric("resident_vm_count",
+		residentVMCountMetric := c.newMetric("resident_vm_count",
 			"count of VMs running on the host", hostLabels,
 			float64(vmCount))
-		c.metricsStaging = append(c.metricsStaging, residentVMCountMetric)
+		c.metrics = append(c.metrics, residentVMCountMetric)
 
 	}
 
+	// maintain list of default pool SRs for default metric later in SR loop
 	var defaultSRList []xenAPI.SRRef
 
 	for _, poolRec := range poolRecs {
+
 		defaultSRList = append(defaultSRList, poolRec.DefaultSR)
 
 		// are we this pool's master?
@@ -214,43 +219,46 @@ func (c *xenCollector) Update(ch chan<- prometheus.Metric) (err error) {
 			continue
 		}
 
+		// prom lables suitable for a pool
 		poolLabels := prometheus.Labels{"pool": poolRec.NameLabel}
 
 		// set ha_allow_overcommit metric for pool
-		haAllowOvercommitMetric := newMetric("ha_allow_overcommit",
+		haAllowOvercommitMetric := c.newMetric("ha_allow_overcommit",
 			"if set to false then operations which would cause the pool to become "+
 				"overcommitted will be blocked", poolLabels,
-			boolToFloat(poolRec.HaAllowOvercommit))
-		c.metricsStaging = append(c.metricsStaging, haAllowOvercommitMetric)
+			boolToFloat[poolRec.HaAllowOvercommit])
+		c.metrics = append(c.metrics, haAllowOvercommitMetric)
 
 		// set ha_enabled metric for pool
-		haEnabledMetric := newMetric("ha_enabled",
+		haEnabledMetric := c.newMetric("ha_enabled",
 			"true if HA is enabled on the pool", poolLabels,
-			boolToFloat(poolRec.HaEnabled))
-		c.metricsStaging = append(c.metricsStaging, haEnabledMetric)
+			boolToFloat[poolRec.HaEnabled])
+		c.metrics = append(c.metrics, haEnabledMetric)
 
 		// set ha_host_failures_to_tolerate metric for pool
-		haHostFailuresToTolerateMetric := newMetric(
+		haHostFailuresToTolerateMetric := c.newMetric(
 			"ha_host_failures_to_tolerate",
 			"number of host failures to tolerate before the "+
 				"pool is declared to be overcommitted", poolLabels,
 			float64(poolRec.HaHostFailuresToTolerate))
-		c.metricsStaging = append(c.metricsStaging, haHostFailuresToTolerateMetric)
+		c.metrics = append(c.metrics, haHostFailuresToTolerateMetric)
 
 		// set the ha_overcommitted metric for pool
-		haOvercommittedMetric := newMetric("ha_overcommitted",
+		haOvercommittedMetric := c.newMetric("ha_overcommitted",
 			"true if the pool is considered to be overcommitted", poolLabels,
-			boolToFloat(poolRec.HaOvercommitted))
-		c.metricsStaging = append(c.metricsStaging, haOvercommittedMetric)
+			boolToFloat[poolRec.HaOvercommitted])
+		c.metrics = append(c.metrics, haOvercommittedMetric)
 
 		// set the wlb_enabled metric for the pool
-		wlbEnabledMetric := newMetric("wlb_enabled",
+		wlbEnabledMetric := c.newMetric("wlb_enabled",
 			"true if workload balancing is enabled on the pool", poolLabels,
-			boolToFloat(poolRec.WlbEnabled))
-		c.metricsStaging = append(c.metricsStaging, wlbEnabledMetric)
+			boolToFloat[poolRec.WlbEnabled])
+		c.metrics = append(c.metrics, wlbEnabledMetric)
 	}
 
 	for srRef, srRec := range srRecs {
+
+		// metric labels suitable for a SR
 		srLabels := prometheus.Labels{
 			"uuid":       srRec.UUID,
 			"type":       srRec.Type,
@@ -284,22 +292,22 @@ func (c *xenCollector) Update(ch chan<- prometheus.Metric) (err error) {
 		}
 
 		// set the default_storage metric for the sr
-		defaultStorageMetric := newMetric("default_storage",
+		defaultStorageMetric := c.newMetric("default_storage",
 			"true if SR is a default SR for VDIs", srLabels,
-			boolToFloat(defaultSR))
-		c.metricsStaging = append(c.metricsStaging, defaultStorageMetric)
+			boolToFloat[defaultSR])
+		c.metrics = append(c.metrics, defaultStorageMetric)
 
 		// set the physical_size metric for the sr
-		physicalSizeMetric := newMetric("physical_size",
+		physicalSizeMetric := c.newMetric("physical_size",
 			"total physicalk size of the repository (in bytes)", srLabels,
 			float64(srRec.PhysicalSize))
-		c.metricsStaging = append(c.metricsStaging, physicalSizeMetric)
+		c.metrics = append(c.metrics, physicalSizeMetric)
 
 		// set the physical_utilisation metric for the sr
-		physicalUtilisationMetric := newMetric("physical_utilisation",
+		physicalUtilisationMetric := c.newMetric("physical_utilisation",
 			"physical space currently utilised on this storage repository (bytes)",
 			srLabels, float64(srRec.PhysicalUtilisation))
-		c.metricsStaging = append(c.metricsStaging, physicalUtilisationMetric)
+		c.metrics = append(c.metrics, physicalUtilisationMetric)
 
 		// set the physical_pct_allocated metric for the sr
 		physicalPctAllocated := float64(0)
@@ -307,20 +315,39 @@ func (c *xenCollector) Update(ch chan<- prometheus.Metric) (err error) {
 			physicalPctAllocated = float64(srRec.PhysicalUtilisation) * 100 /
 				float64(srRec.PhysicalSize)
 		}
-		physicalPctAllocatedMetric := newMetric("physical_pct_allocated",
+		physicalPctAllocatedMetric := c.newMetric("physical_pct_allocated",
 			"percent of physical_utilisation over physical_size", srLabels,
 			physicalPctAllocated)
-		c.metricsStaging = append(c.metricsStaging, physicalPctAllocatedMetric)
+		c.metrics = append(c.metrics, physicalPctAllocatedMetric)
 
 		// set the virtual_allocation metric for the sr
-		virtualAllocationMetric := newMetric("virtual_allocation",
+		virtualAllocationMetric := c.newMetric("virtual_allocation",
 			"sum of virtualk_sizes of all VDIs in the SR (bytes)",
 			srLabels, float64(srRec.VirtualAllocation))
-		c.metricsStaging = append(c.metricsStaging, virtualAllocationMetric)
+		c.metrics = append(c.metrics, virtualAllocationMetric)
 
 	}
 
-	c.metrics = c.metricsStaging
+	return nil
+}
+
+func (c *xenCollector) Update(ch chan<- prometheus.Metric) (err error) {
+
+	// if an error occurs getting data from xapi, log it and set failure boolean
+	var xapiFailure float64
+	xenErr := c.genXAPIMetrics()
+	if xenErr != nil {
+		xapiFailure = 1
+		log.Errorln(xenErr)
+	}
+
+	// set the failure metric for the xapi collector as a whole
+	xapiFailureMetric := c.newMetric("failure",
+		"boolean indicates problem with xapi interface",
+		nil, xapiFailure)
+	c.metrics = append(c.metrics, xapiFailureMetric)
+
+	// report metrics!
 	for _, metric := range c.metrics {
 		metric.Collect(ch)
 	}
