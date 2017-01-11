@@ -27,7 +27,7 @@ import (
 
 	"github.com/prometheus/common/log"
 
-	xenAPI "github.com/amfranz/go-xen-api-client"
+	xenAPI "github.com/johnprather/go-xen-api-client"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -91,6 +91,8 @@ func (c *xenCollector) genXAPIMetrics() ([]prometheus.Gauge, error) {
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create xapi client: %s", err.Error())
 	}
+
+	defer xenClient.Close()
 
 	sessionID, err := xenClient.Session.LoginWithPassword(
 		"root", "", "1.0", "node_exporter")
