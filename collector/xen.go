@@ -34,11 +34,21 @@ import (
 const xapiSocket = "/var/xapi/xapi"
 const xapiPrefix = "xapi"
 const xapiTimeout = 5
+const xapiInterval = 60
 
 type xenCollector struct {
-	metrics     []prometheus.Gauge
-	boolToFloat map[bool]float64
+	metrics               XenMetricSet
+	metricsRead           chan chan XenMetricSet
+	metricsWrite          chan XenMetricSet
+	metricsLastUpdate     int64
+	metricsLastUpdateRead chan chan int64
+	launched              bool
+	launchedRead          chan chan bool
+	launchedWrite         chan chan bool
+	boolToFloat           map[bool]float64
 }
+
+type XenMetricSet []prometheus.Gauge
 
 func init() {
 	Factories["xapi"] = NewXenCollector
@@ -50,7 +60,76 @@ func NewXenCollector() (Collector, error) {
 
 	// this comes in handy for quickly throwing together boolean metrics
 	c.boolToFloat = map[bool]float64{true: 1, false: 0}
+
+	// setup metrics read/writes
+	c.metricsRead = make(chan chan XenMetricSet)
+	c.metricsWrite = make(chan XenMetricSet)
+	c.metricsLastUpdateRead = make(chan chan int64)
+	c.launchedRead = make(chan chan bool)
+	c.launchedWrite = make(chan chan bool)
+	go c.listenRW()
 	return c, nil
+}
+
+// listenRW is a routine that handles read/write of shared data
+func (c *xenCollector) listenRW() {
+	for {
+		select {
+		case ch := <-c.metricsRead:
+			ch <- c.metrics.dup()
+		case metrics := <-c.metricsWrite:
+			c.metrics = metrics.dup()
+			c.metricsLastUpdate = time.Now().Unix()
+		case ch := <-c.launchedRead:
+			ch <- c.launched
+		case ch := <-c.launchedWrite:
+			changed := false
+			if !c.launched {
+				changed = true
+			}
+			c.launched = true
+			ch <- changed
+		case ch := <-c.metricsLastUpdateRead:
+			ch <- c.metricsLastUpdate
+		}
+	}
+}
+
+// setMetrics is a thread safe write for c.metrics
+func (c *xenCollector) setMetrics(metrics XenMetricSet) {
+	c.metricsWrite <- metrics
+}
+
+// getMetrics is a thread-safe read for c.metrics
+func (c *xenCollector) getMetrics() XenMetricSet {
+	ch := make(chan XenMetricSet)
+	c.metricsRead <- ch
+	metrics := <-ch
+	return metrics
+}
+
+// getMetricsLastUpdate is a thread-safe read for c.metricsLastUpdate
+func (c *xenCollector) getMetricsLastUpdate() int64 {
+	ch := make(chan int64)
+	c.metricsLastUpdateRead <- ch
+	metricsLastUpdate := <-ch
+	return metricsLastUpdate
+}
+
+// setLaunched is a thread-safe write for c.launched
+func (c *xenCollector) setLaunched() bool {
+	ch := make(chan bool)
+	c.launchedWrite <- ch
+	changed := <-ch
+	return changed
+}
+
+// getLaunched is a thread-safe read for c.launched
+func (c *xenCollector) getLaunched() bool {
+	ch := make(chan bool)
+	c.launchedRead <- ch
+	launched := <-ch
+	return launched
 }
 
 // newMetric instantiates a prometheus Gauge object
@@ -67,14 +146,19 @@ func (c *xenCollector) newMetric(name string, help string,
 	return metric
 }
 
+// dup creates a new XenMetricSet which is a copy of s (slices are pointers)
+func (s XenMetricSet) dup() XenMetricSet {
+	var set XenMetricSet
+	set = append(set, s...)
+	return set
+}
+
 // genXAPIMetrics pulls data from xapi and populates newMetrics
 func (c *xenCollector) genXAPIMetrics() ([]prometheus.Gauge, error) {
-
-	// init an empty array of metrics
-	newMetrics := make([]prometheus.Gauge, 0)
-
+	var newMetrics XenMetricSet
 	var myHostRef xenAPI.HostRef
 	var iAmMaster bool
+
 	myHostname, err := os.Hostname()
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get my own hostname: %s", err)
@@ -339,57 +423,64 @@ func (c *xenCollector) genXAPIMetrics() ([]prometheus.Gauge, error) {
 	return newMetrics, nil
 }
 
-func (c *xenCollector) Update(ch chan<- prometheus.Metric) (err error) {
-	// init metrics
-	var metrics []prometheus.Gauge
+// gatherLoop is intended to run as a go routine for handling metrics population
+func (c *xenCollector) gatherLoop() {
+	log.Debugln("starting gatherLoop")
+	defer log.Debugln("returning from gatherLoop")
+	for {
+		xapiFailure := false
 
-	// channels for catching results from the metrics generation go routine
-	genErrCh := make(chan error)
-	genMetricsCh := make(chan []prometheus.Gauge)
-
-	// launch generation in own routine, return results through genErrCh
-	go func(c *xenCollector, genErrCh chan error,
-		genMetricsCh chan []prometheus.Gauge) {
-
-		// attempt to generate xapi stats
+		// attempt to generate xapi metrics
 		genMetrics, genErr := c.genXAPIMetrics()
 		if genErr != nil {
-			// error occurred, send it through the error chan
-			genErrCh <- genErr
-		} else {
-			// no error, send metric array through the metrics chan
-			genMetricsCh <- genMetrics
+			log.Errorln(genErr)
+			xapiFailure = true
 		}
 
-	}(c, genErrCh, genMetricsCh)
+		// set xapi failure metric appropriately
+		xapiFailureMetric := c.newMetric("failure",
+			"boolean indicates problem with xapi interface",
+			nil, c.boolToFloat[xapiFailure])
+		genMetrics = append(genMetrics, xapiFailureMetric)
 
-	// init a failure bool to false
-	xapiFailure := false
+		// save our newly generated metrics to the collector's shared metrics object
+		c.setMetrics(genMetrics)
 
-	// wait for either results or a timeout
-	select {
+		// wait a bit before doing it all over again
+		time.Sleep(time.Duration(xapiInterval) * time.Second)
+	}
+}
 
-	// handle error passed from the metrics generation go routine
-	case xenErr := <-genErrCh:
-		log.Errorln(xenErr)
-		xapiFailure = true
+func (c *xenCollector) Update(ch chan<- prometheus.Metric) (err error) {
 
-	// handle metric array from metrics generation go routine
-	case xenMetrics := <-genMetricsCh:
-		metrics = xenMetrics
-
-	// handle timeout waiting for metrics generation
-	case <-time.After(time.Duration(xapiTimeout) * time.Second):
-		log.Errorf("xapi stats generation timeout after %d seconds", xapiTimeout)
-		xapiFailure = true
-
+	// if setLaunched results in a change, launch gathering thread
+	if c.setLaunched() {
+		go c.gatherLoop()
 	}
 
-	// set the failure metric for the xapi collector as a whole
-	xapiFailureMetric := c.newMetric("failure",
-		"boolean indicates problem with xapi interface",
-		nil, c.boolToFloat[xapiFailure])
-	metrics = append(metrics, xapiFailureMetric)
+	// if gatherloop was just launched, metrics may be empty
+	// wait up to 5 secs @ 100ms intervals for metrics to populate
+	var metrics = c.getMetrics()
+	if len(metrics) == 0 {
+		startTime := time.Now().Unix()
+		for len(metrics) == 0 {
+			if time.Now().Unix()-startTime > 5 {
+				break
+			}
+			time.Sleep(time.Duration(100) * time.Millisecond)
+			metrics = c.getMetrics()
+		}
+	}
+
+	// if we have last update info, add it to metrics so staleness is detectable
+	lastUpdate := c.getMetricsLastUpdate()
+
+	if lastUpdate != 0 {
+		ageMetric := c.newMetric("xapi_metrics_age",
+			"age in seconds of current xapi metrics", nil,
+			float64(time.Now().Unix()-lastUpdate))
+		metrics = append(metrics, ageMetric)
+	}
 
 	// report metrics!
 	for _, metric := range metrics {
